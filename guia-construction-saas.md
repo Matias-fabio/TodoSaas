@@ -362,4 +362,45 @@ public class WorkspacesController : ApiControllerBase
 }
 ```
 
+### 5. Resolución de Errores Comunes de Inyección de Dependencias
+Durante la integración de la API con MediatR y el contexto de base de datos, es común enfrentarse a errores de resolución de tipos en el arranque de la aplicación.
+
+* **El Error:**
+  `Unable to resolve service for type 'TodoSaaS.Application.Common.Interfaces.IApplicationDbContext' while attempting to activate 'TodoSaaS.Application.Workspaces.Commands.CreateWorkspace.CreateWorkspaceCommandHandler'`
+* **La Causa:**
+  Registramos `ApplicationDbContext` en el contenedor de dependencias, pero el manejador (Handler) de MediatR solicita en su constructor la interfaz `IApplicationDbContext`. El contenedor de dependencias no sabía de manera automática que al pedir esa interfaz debía entregar la implementación del DbContext.
+* **La Solución:**
+  Mapear la interfaz con la clase concreta en `Program.cs` usando un ciclo de vida `Scoped` (el mismo que el del DbContext):
+  ```csharp
+  using TodoSaaS.Application.Common.Interfaces; // namespace necesario
+  
+  builder.Services.AddScoped<IApplicationDbContext>(provider => provider.GetRequiredService<ApplicationDbContext>());
+  ```
+  *(Se usa `GetRequiredService` para reutilizar la misma instancia y configuración de conexión que ya maneja EF Core).*
+
+---
+
+## FASE 5: Ejecución y Pruebas de Funcionamiento
+
+Validamos todo el flujo limpio levantando el servidor de desarrollo y realizando una petición HTTP POST real.
+
+### 1. Iniciar el Servidor de la Web API
+```bash
+dotnet run --project TodoSaaS.WebApi/TodoSaaS.WebApi.csproj
+```
+El servidor arrancará e indicará las URLs en las que está escuchando (por ejemplo, `http://localhost:5003`).
+
+### 2. Pruebas Interactivas con Swagger
+1. Abrir el navegador e ingresar a `http://localhost:5003/swagger/index.html`.
+2. Ubicar el endpoint `POST /api/Workspaces`.
+3. Presionar **"Try it out"** y enviar el JSON de prueba:
+   ```json
+   {
+     "name": "Mi Primer Workspace",
+     "description": "Contenedor de tableros"
+   }
+   ```
+4. Presionar **"Execute"**. La respuesta correcta es un código `200 OK` acompañado de un identificador `Guid` único autogenerado en la base de datos PostgreSQL.
+
+
 ```
