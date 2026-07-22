@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using TodoSaaS.Infrastructure.Persistence;
 using TodoSaaS.Application.Common.Interfaces;
+using TodoSaaS.Application;
 
 
 var builder = WebApplication.CreateBuilder(args);
@@ -11,9 +12,9 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddDbContext<ApplicationDbContext>(options =>
         options.UseNpgsql(builder.Configuration.GetConnectionString("DefaultConnection")));
 builder.Services.AddControllers();   
-builder.Services.AddMediatR(cfg => {
-        cfg.RegisterServicesFromAssembly(typeof(TodoSaaS.Application.Common.Interfaces.IApplicationDbContext).Assembly);
-    });
+
+builder.Services.AddApplicationServices();
+
 builder.Services.AddScoped<IApplicationDbContext>(provider => provider.GetRequiredService<ApplicationDbContext>());
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
@@ -26,6 +27,7 @@ if (app.Environment.IsDevelopment())
     app.UseSwagger();
     app.UseSwaggerUI();
 }
+app.UseMiddleware<TodoSaaS.WebApi.Middlewares.CustomExceptionHandlerMiddleware>();
 
 app.UseHttpsRedirection();
 

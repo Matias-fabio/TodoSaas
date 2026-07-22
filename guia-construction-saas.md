@@ -402,5 +402,161 @@ El servidor arrancará e indicará las URLs en las que está escuchando (por eje
    ```
 4. Presionar **"Execute"**. La respuesta correcta es un código `200 OK` acompañado de un identificador `Guid` único autogenerado en la base de datos PostgreSQL.
 
+---
+
+## FASE 6: Validaciones con FluentValidation y Pipeline Behaviors
+
+Para asegurar que los datos ingresados al sistema cumplan con las reglas de negocio antes de tocar la base de datos, implementamos validaciones automáticas mediante **Pipeline Behaviors** (Middlewares internos de MediatR) y **FluentValidation**.
+
+### 1. Instalación de Paquetes
+```bash
+# Agregar FluentValidation al proyecto de Aplicación
+dotnet add TodoSaaS.Application/TodoSaaS.Application.csproj package FluentValidation.DependencyInjectionExtensions -v 11.9.2
+```
+
+### 2. Clase Excepción Personalizada (`TodoSaaS.Application/Common/Exceptions/ValidationException.cs`)
+Agrupa todos los errores de validación por campo para retornar un formato estandarizado (RFC 7807) en lugar de una excepción genérica:
+```csharp
+using FluentValidation.Results;
+
+namespace TodoSaaS.Application.Common.Exceptions;
+
+public class ValidationException : Exception
+{
+    public IDictionary<string, string[]> Errors { get; }
+
+    public ValidationException()
+        : base("Se han producido uno o más errores de validación.")
+    {
+        Errors = new Dictionary<string, string[]>();
+    }
+
+    public ValidationException(IEnumerable<ValidationFailure> failures)
+        : this()
+    {
+        Errors = failures
+            .GroupBy(e => e.PropertyName, e => e.ErrorMessage)
+            .ToDictionary(failureGroup => failureGroup.Key, failureGroup => failureGroup.ToArray());
+    }
+}
+```
+
+### 3. Comportamiento del Pipeline (`TodoSaaS.Application/Common/Behaviors/ValidationBehavior.cs`)
+Intercepta cualquier petición (Command/Query) antes de llegar a su Handler para ejecutar los validadores correspondientes.
+```csharp
+using MediatR;
+using FluentValidation;
+using ValidationException = TodoSaaS.Application.Common.Exceptions.ValidationException;
+
+namespace TodoSaaS.Application.Common.Behaviors;
+
+public class ValidationBehavior<TRequest, TResponse> : IPipelineBehavior<TRequest, TResponse>
+    where TRequest : IRequest<TResponse>
+{
+    private readonly IEnumerable<IValidator<TRequest>> _validators;
+
+    public ValidationBehavior(IEnumerable<IValidator<TRequest>> validators)
+    {
+        _validators = validators;
+    }
+
+    public async Task<TResponse> Handle(TRequest request, RequestHandlerDelegate<TResponse> next, CancellationToken cancellationToken)
+    {
+        if (_validators.Any())
+        {
+            var context = new ValidationContext<TRequest>(request);
+            var validationResults = await Task.WhenAll(
+                _validators.Select(v => v.ValidateAsync(context, cancellationToken)));
+
+            var failures = validationResults
+                .SelectMany(r => r.Errors)
+                .Where(f => f != null)
+                .ToList();
+
+            if (failures.Count != 0)
+                throw new ValidationException(failures);
+        }
+
+        return await next();
+    }
+}
+```
+
+### 4. Validador Concreto (`TodoSaaS.Application/Workspaces/Commands/CreateWorkspace/CreateWorkspaceCommandValidator.cs`)
+```csharp
+using FluentValidation;
+
+namespace TodoSaaS.Application.Workspaces.Commands.CreateWorkspace;
+
+public class CreateWorkspaceCommandValidator : AbstractValidator<CreateWorkspaceCommand>
+{
+    public CreateWorkspaceCommandValidator()
+    {
+        RuleFor(v => v.Name)
+            .NotEmpty().WithMessage("El nombre del espacio de trabajo es requerido.")
+            .MaximumLength(100).WithMessage("El nombre no puede superar los 100 caracteres.");
+
+        RuleFor(v => v.Description)
+            .MaximumLength(500).WithMessage("La descripción no puede superar los 500 caracteres.");
+    }
+}
+```
+
+### 5. Encapsulado del Registro (`TodoSaaS.Application/DependencyInjection.cs`)
+Clase estática para que la capa de aplicación registre sus propios servicios de manera autónoma, respetando la separación de conceptos:
+```csharp
+using System.Reflection;
+using MediatR;
+using FluentValidation;
+using Microsoft.Extensions.DependencyInjection;
+using TodoSaaS.Application.Common.Behaviors;
+
+namespace TodoSaaS.Application;
+
+public static class DependencyInjection
+{
+    public static IServiceCollection AddApplicationServices(this IServiceCollection services)
+    {
+        services.AddValidatorsFromAssembly(Assembly.GetExecutingAssembly());
+
+        services.AddMediatR(cfg => {
+            cfg.RegisterServicesFromAssembly(Assembly.GetExecutingAssembly());
+            cfg.AddBehavior(typeof(IPipelineBehavior<,>), typeof(ValidationBehavior<,>));
+        });
+
+        return services;
+    }
+}
+```
+
+---
+
+## Explicación Detallada de la Fase 6
+
+### ¿Cómo funciona el flujo de validación automática?
+Cuando el controlador llama a `Mediator.Send(command)`, la petición no viaja directamente al `Handler`. En su lugar, pasa a través de una tubería (pipeline) de comportamientos.
+
+```
+Petición HTTP -> Controlador -> [ Mediator.Send ]
+                                       |
+                                       v
+                             [ ValidationBehavior ]
+                                       |
+                       (¿Hay fallos de validación?)
+                              /          \
+                            SÍ            NO
+                            /              \
+           [ lanza ValidationException ]   [ CreateWorkspaceCommandHandler ]
+                                                    |
+                                                    v
+                                            [ Guarda en DB ]
+```
+
+1. **`ValidationBehavior`**: Actúa como un interceptor genérico. Recibe una lista de todos los validadores (`IValidator<TRequest>`) que coincidan con el tipo de comando enviado.
+2. **`Task.WhenAll`**: Ejecuta todas las reglas de validación en paralelo para optimizar la velocidad de respuesta.
+3. **`ValidationException`**: Si algún validador detecta un fallo, el comportamiento detiene la ejecución del flujo de inmediato y lanza esta excepción personalizada. Esto previene que se intente procesar un comando inválido o se guarde información corrupta en la base de datos.
+4. **`DependencyInjection` de Aplicación**: En lugar de ensuciar el `Program.cs` del proyecto web registrando manualmente cada validador o comportamiento, creamos un método de extensión `AddApplicationServices`. Esto encapsula los detalles de configuración dentro de la propia capa de Aplicación.
+
+
 
 ```
