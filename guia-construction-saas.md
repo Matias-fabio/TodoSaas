@@ -557,6 +557,202 @@ Petición HTTP -> Controlador -> [ Mediator.Send ]
 3. **`ValidationException`**: Si algún validador detecta un fallo, el comportamiento detiene la ejecución del flujo de inmediato y lanza esta excepción personalizada. Esto previene que se intente procesar un comando inválido o se guarde información corrupta en la base de datos.
 4. **`DependencyInjection` de Aplicación**: En lugar de ensuciar el `Program.cs` del proyecto web registrando manualmente cada validador o comportamiento, creamos un método de extensión `AddApplicationServices`. Esto encapsula los detalles de configuración dentro de la propia capa de Aplicación.
 
+### 6. Control Global de Excepciones (Capa WebApi)
 
+Para evitar que la `ValidationException` (que detiene el hilo de ejecución) devuelva un error genérico `500 Server Error`, creamos un Middleware que captura las excepciones y les da un formato HTTP estandarizado.
+
+* **`TodoSaaS.WebApi/Middlewares/CustomExceptionHandlerMiddleware.cs`**:
+```csharp
+using System.Text.Json;
+using TodoSaaS.Application.Common.Exceptions;
+
+namespace TodoSaaS.WebApi.Middlewares;
+
+public class CustomExceptionHandlerMiddleware
+{
+    private readonly RequestDelegate _next;
+
+    public CustomExceptionHandlerMiddleware(RequestDelegate next)
+    {
+        _next = next;
+    }
+
+    public async Task Invoke(HttpContext context)
+    {
+        try
+        {
+            await _next(context);
+        }
+        catch (Exception ex)
+        {
+            await HandleExceptionAsync(context, ex);
+        }
+    }
+
+    private static Task HandleExceptionAsync(HttpContext context, Exception exception)
+    {
+        var code = StatusCodes.Status500InternalServerError;
+        var result = string.Empty;
+
+        if (exception is ValidationException validationException)
+        {
+            code = StatusCodes.Status400BadRequest;
+            result = JsonSerializer.Serialize(new { 
+                title = "Ocurrieron uno o más errores de validación.",
+                status = code,
+                errors = validationException.Errors 
+            });
+        }
+        else
+        {
+            result = JsonSerializer.Serialize(new { 
+                title = "Error interno del servidor.", 
+                status = code,
+                detail = exception.Message 
+            });
+        }
+
+        context.Response.ContentType = "application/json";
+        context.Response.StatusCode = code;
+
+        return context.Response.WriteAsync(result);
+    }
+}
+```
+
+* **Registro del Middleware y Limpieza de Servicios en `TodoSaaS.WebApi/Program.cs`**:
+```csharp
+using TodoSaaS.Application; // Namespace de la extensión de dependencias
+
+// 1. Reemplazamos la configuración de MediatR por nuestro método unificado
+builder.Services.AddApplicationServices();
+
+// 2. Activamos el middleware de excepciones (debe ir antes de otros middlewares de enrutamiento)
+app.UseMiddleware<TodoSaaS.WebApi.Middlewares.CustomExceptionHandlerMiddleware>();
+
+app.UseHttpsRedirection();
+app.MapControllers();
+```
+
+---
+
+## Explicación Detallada de los Middlewares en ASP.NET Core
+
+### ¿Qué es un Middleware y qué es el HTTP Pipeline?
+En ASP.NET Core, el **HTTP Pipeline (tubería HTTP)** es una secuencia de componentes de software (llamados **Middlewares**) que se encadenan uno detrás de otro. Cada petición que entra desde la web pasa a través de estos middlewares antes de llegar a los controladores de la API, y la respuesta que regresa pasa por ellos en orden inverso.
 
 ```
+Petición Web (Request) ──> [ Exception Middleware ] ──> [ Https Redirection ] ──> [ Routing/Controllers ]
+                                                                                         │ (Procesa lógica)
+Respuesta Web (Response) <── [ Devuelve JSON 400 ]   <── [ Cifra canal ]      <── [ Retorna Excepción ]
+```
+
+### ¿Por qué colocamos el Middleware de Excepciones arriba del todo?
+1. **El principio de la Tubería:** Un middleware puede decidir si pasa la petición al siguiente componente usando `await _next(context)` o si la corta de inmediato.
+2. **El bloque `try-catch` global:** Nuestro `CustomExceptionHandlerMiddleware` ejecuta `await _next(context)` dentro de un bloque `try-catch`. Esto significa que **cualquier excepción** que ocurra en *cualquier* middleware posterior, controlador o servicio del backend "burbujeará" hacia atrás y será capturada por este middleware.
+3. **Conversión limpia:** En lugar de dejar que la app termine abruptamente (lo cual genera un error 500 feo y sin información), el middleware intercepta el error, analiza si es un problema de entrada del usuario (HTTP 400 Bad Request por validaciones) y escribe un JSON estructurado directamente en la respuesta HTTP.
+
+---
+
+## FASE 7: Consultas (Queries) y Proyección de Datos (DTOs)
+
+Implementamos la lectura de datos (*Queries*) del patrón CQRS para listar los espacios de trabajo registrados en la base de datos PostgreSQL, utilizando objetos DTO para transportar la información.
+
+### 1. Definición del Objeto de Transferencia de Datos (`TodoSaaS.Application/Workspaces/Queries/WorkspaceDto.cs`)
+```csharp
+namespace TodoSaaS.Application.Workspaces.Queries;
+
+public class WorkspaceDto
+{
+    public Guid Id { get; set; }
+    public string Name { get; set; } = string.Empty;
+    public string Description { get; set; } = string.Empty;
+}
+```
+
+### 2. Definición de la Consulta (`TodoSaaS.Application/Workspaces/Queries/GetWorkspaces/GetWorkspacesQuery.cs`)
+```csharp
+using MediatR;
+
+namespace TodoSaaS.Application.Workspaces.Queries.GetWorkspaces;
+
+public record GetWorkspacesQuery : IRequest<List<WorkspaceDto>>;
+```
+
+### 3. Implementación del Manejador (`TodoSaaS.Application/Workspaces/Queries/GetWorkspaces/GetWorkspacesQueryHandler.cs`)
+```csharp
+using MediatR;
+using Microsoft.EntityFrameworkCore;
+using TodoSaaS.Application.Common.Interfaces;
+
+namespace TodoSaaS.Application.Workspaces.Queries.GetWorkspaces;
+
+public class GetWorkspacesQueryHandler : IRequestHandler<GetWorkspacesQuery, List<WorkspaceDto>>
+{
+    private readonly IApplicationDbContext _context;
+
+    public GetWorkspacesQueryHandler(IApplicationDbContext context)
+    {
+        _context = context;
+    }
+
+    public async Task<List<WorkspaceDto>> Handle(GetWorkspacesQuery request, CancellationToken cancellationToken)
+    {
+        return await _context.Workspaces
+            .AsNoTracking()
+            .Select(w => new WorkspaceDto
+            {
+                Id = w.Id,
+                Name = w.Name,
+                Description = w.Description
+            })
+            .ToListAsync(cancellationToken);
+    }
+}
+```
+
+### 4. Exposición del Endpoint GET (`TodoSaaS.WebApi/Controllers/WorkspacesController.cs`)
+```csharp
+using Microsoft.AspNetCore.Mvc;
+using TodoSaaS.Application.Workspaces.Commands.CreateWorkspace;
+using TodoSaaS.Application.Workspaces.Queries;
+using TodoSaaS.Application.Workspaces.Queries.GetWorkspaces;
+
+namespace TodoSaaS.WebApi.Controllers;
+
+public class WorkspacesController : ApiControllerBase
+{
+    [HttpPost]
+    public async Task<ActionResult<Guid>> Create(CreateWorkspaceCommand command)
+    {
+        var workspaceId = await Mediator.Send(command);
+        return Ok(workspaceId);
+    }
+
+    [HttpGet]
+    public async Task<ActionResult<List<WorkspaceDto>>> Get()
+    {
+        var workspaces = await Mediator.Send(new GetWorkspacesQuery());
+        return Ok(workspaces);
+    }
+}
+```
+
+---
+
+## Explicación Detallada de la Fase 7
+
+### ¿Qué es un DTO (Data Transfer Object) y por qué lo usamos?
+Un DTO es un objeto diseñado con el único propósito de transportar datos desde la API hacia el cliente (React) y viceversa. 
+
+* **¿Por qué no devolvemos la Entidad de Dominio (`Workspace`) directamente?**
+  1. **Evitar sobreexposición de datos:** Las entidades de base de datos pueden tener propiedades sensibles o de auditoría que el frontend no necesita (ej: contraseñas cifradas, tokens internos, columnas de control como `LastModifiedAt`).
+  2. **Prevenir dependencias cíclicas en la serialización:** Si intentas devolver `Workspace` directamente a JSON, el serializador intentará cargar la propiedad `Boards`, y cada `Board` intentará cargar su `Workspace`, generando un bucle infinito que rompe la aplicación.
+  3. **Independencia del modelo de base de datos:** Si mañana decides cambiar el nombre de una columna de base de datos en la entidad `Workspace`, el DTO puede mantenerse intacto, evitando romper la integración con el frontend.
+
+### ¿Qué hace `.AsNoTracking()` en Entity Framework Core?
+Por defecto, cuando EF Core realiza una consulta, coloca todas las entidades obtenidas en un "área de seguimiento de cambios" (Change Tracker) en memoria. Si tú modificas una propiedad del objeto más adelante en el código, EF Core se dará cuenta y actualizará la base de datos al llamar a `SaveChangesAsync`.
+
+* En una **Query de lectura pura**, sabemos que no vamos a modificar los datos.
+* Al usar `.AsNoTracking()`, le indicamos a EF Core: *"Trae estos datos de la base de datos pero no gastes recursos de CPU ni memoria rastreándolos"*.
+* Esto mejora drásticamente el rendimiento de lectura de la aplicación (especialmente útil en listados grandes en sistemas SaaS).
