@@ -38,6 +38,17 @@ public class CustomExceptionHandlerMiddleware
                     errors = validationException.Errors 
                 });
             }
+            else if (exception is NotFoundException notFoundException)
+        {
+            code = StatusCodes.Status404NotFound;
+            result = JsonSerializer.Serialize(new
+            {
+                title = "Recurso no encontrado.",
+                    status = code,
+                    detail = notFoundException.Message
+
+            });
+        }
             else
             {
                 result = JsonSerializer.Serialize(new { 

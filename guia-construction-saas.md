@@ -756,3 +756,195 @@ Por defecto, cuando EF Core realiza una consulta, coloca todas las entidades obt
 * En una **Query de lectura pura**, sabemos que no vamos a modificar los datos.
 * Al usar `.AsNoTracking()`, le indicamos a EF Core: *"Trae estos datos de la base de datos pero no gastes recursos de CPU ni memoria rastreándolos"*.
 * Esto mejora drásticamente el rendimiento de lectura de la aplicación (especialmente útil en listados grandes en sistemas SaaS).
+
+### Resumen del estado actual del proyecto:
+
+  1. Dominio: Entidades base del SaaS diseñadas (Workspace, Board, BoardList, ProjectTask).
+  2. Base de Datos: PostgreSQL enlazado, configurado y con migraciones aplicadas.
+  3. Escritura (CQRS Commands): Validación automática en tubería (MediatR Behaviors + FluentValidation) y almacenamiento seguro de
+  datos.
+  4. Lectura (CQRS Queries): Extracción optimizada (AsNoTracking) y mapeo a DTOs.
+  5. Control de Errores: Middleware global que intercepta excepciones y responde con formatos estandarizados.
+  6. API: Exposición de endpoints REST mediante controladores (POST y GET de Workspaces).
+  7. Documentación: Guía paso a paso (guia-construction-saas.md) al día en tu repositorio, lista para ser cargada en tu PC principal
+  o ser descargada en PDF.
+
+Ahora que la entidad Workspace está cubierta, el siguiente paso natural es implementar los Tableros (Boards). Cada Tablero debe
+  pertenecer a un Workspace específico.
+
+  Para hacer esto a nivel profesional, introduciremos un nuevo concepto clave: Manejo de Errores 404 (Not Found).
+  Si un usuario intenta crear un Tablero dentro de un Workspace que no existe (por ejemplo, enviando un WorkspaceId inventado), la
+  API no debe dejarlo avanzar y debe responder con un error 404 Not Found de manera automática.
+  ──────
+  ## FASE 8: Gestión de Tableros (Boards) y Manejo de Errores 404 (NotFound)
+  ### Paso 8.1: Crear la excepción NotFoundException
+
+  Crearemos una excepción personalizada para representar recursos que no existen en la base de datos.
+
+  1. Dentro de TodoSaaS.Application/Common/Exceptions/, crea el archivo NotFoundException.cs con este código:
+
+    namespace TodoSaaS.Application.Common.Exceptions;
+    
+    public class NotFoundException : Exception
+    {
+        public NotFoundException(string name, object key)
+            : base($"La entidad \"{name}\" con el identificador ({key}) no fue encontrada.")
+        {
+        }
+    }
+    ──────
+  ### Paso 8.2: Actualizar el Middleware de Excepciones
+
+  Debemos indicarle a nuestro middleware global de WebAPI qué hacer cuando ocurra un NotFoundException para que retorne un código de
+  estado 404.
+
+  1. Abre TodoSaaS.WebApi/Middlewares/CustomExceptionHandlerMiddleware.cs.
+  2. Modifica el método HandleExceptionAsync para agregar una validación para NotFoundException (alrededor de la línea 30):
+
+  (Busca donde se evalúa if (exception is ValidationException validationException) y reemplaza ese bloque condicional por este):
+
+            // Si la excepción es de tipo Validación
+            if (exception is ValidationException validationException)
+            {
+                code = StatusCodes.Status400BadRequest;
+                result = JsonSerializer.Serialize(new { 
+                    title = "Ocurrieron uno o más errores de validación.",
+                    status = code,
+                    errors = validationException.Errors 
+                });
+            }
+            // Si la excepción es de tipo No Encontrado (404)
+            else if (exception is NotFoundException notFoundException)
+            {
+                code = StatusCodes.Status404NotFound;
+                result = JsonSerializer.Serialize(new {
+                    title = "Recurso no encontrado.",
+                    status = code,
+                    detail = notFoundException.Message
+                });
+            }
+            else
+            {
+                result = JsonSerializer.Serialize(new { 
+                    title = "Error interno del servidor.", 
+                    status = code,
+                    detail = exception.Message 
+                });
+            }
+    
+  (No olvides agregar el using TodoSaaS.Application.Common.Exceptions; arriba en el middleware si es necesario).
+  ──────
+  ### Paso 8.3: Crear el comando CreateBoardCommand y su Handler
+
+  Ahora que tenemos las herramientas de error listas, crearemos el comando para añadir un Tablero.
+
+  1. Dentro de TodoSaaS.Application, crea la siguiente ruta de carpetas: Boards/Commands/CreateBoard/.
+  2. Crea el archivo CreateBoardCommand.cs en esa carpeta con el siguiente código:
+
+    using MediatR;
+    
+    namespace TodoSaaS.Application.Boards.Commands.CreateBoard;
+    
+    public record CreateBoardCommand : IRequest<Guid>
+    {
+        public string Name { get; init; } = string.Empty;
+        public string Description { get; init; } = string.Empty;
+        public Guid WorkspaceId { get; init; }
+    }
+    
+  3. Crea el archivo CreateBoardCommandHandler.cs en la misma carpeta con este código:
+
+    using MediatR;
+    using Microsoft.EntityFrameworkCore;
+    using TodoSaaS.Application.Common.Interfaces;
+    using TodoSaaS.Application.Common.Exceptions;
+    using TodoSaaS.Domain.Entities;
+    
+    namespace TodoSaaS.Application.Boards.Commands.CreateBoard;
+    
+    public class CreateBoardCommandHandler : IRequestHandler<CreateBoardCommand, Guid>
+    {
+        private readonly IApplicationDbContext _context;
+    
+        public CreateBoardCommandHandler(IApplicationDbContext context)
+        {
+            _context = context;
+        }
+    
+        public async Task<Guid> Handle(CreateBoardCommand request, CancellationToken cancellationToken)
+        {
+            // 1. Validamos si el Workspace asociado realmente existe en la BD
+            var workspaceExists = await _context.Workspaces
+                .AnyAsync(w => w.Id == request.WorkspaceId, cancellationToken);
+    
+            if (!workspaceExists)
+            {
+                // Lanzamos nuestra excepción personalizada que el middleware convertirá en HTTP 404
+                throw new NotFoundException(nameof(Workspace), request.WorkspaceId);
+            }
+    
+            // 2. Si existe, creamos el Tablero
+            var entity = new Board
+            {
+                Name = request.Name,
+                Description = request.Description,
+                WorkspaceId = request.WorkspaceId
+            };
+
+            _context.Boards.Add(entity);
+            await _context.SaveChangesAsync(cancellationToken);
+
+            return entity.Id;
+        }
+    }
+    ──────
+
+### Paso 8.4: Crear el Validador CreateBoardCommandValidator
+
+  Al igual que con el Workspace, debemos validar que los datos de entrada del Tablero sean correctos (que tenga nombre y que el
+  WorkspaceId no venga vacío).
+
+  1. Crea el archivo CreateBoardCommandValidator.cs dentro de TodoSaaS.Application/Boards/Commands/CreateBoard/ con el siguiente
+  código:
+
+    using FluentValidation;
+    
+    namespace TodoSaaS.Application.Boards.Commands.CreateBoard;
+    
+    public class CreateBoardCommandValidator : AbstractValidator<CreateBoardCommand>
+    {
+        public CreateBoardCommandValidator()
+        {
+            RuleFor(v => v.Name)
+                .NotEmpty().WithMessage("El nombre del tablero es requerido.")
+                .MaximumLength(100).WithMessage("El nombre del tablero no puede superar los 100 caracteres.");
+    
+            RuleFor(v => v.Description)
+                .MaximumLength(500).WithMessage("La descripción no puede superar los 500 caracteres.");
+    
+            RuleFor(v => v.WorkspaceId)
+                .NotEmpty().WithMessage("El identificador del espacio de trabajo (WorkspaceId) es requerido.");
+        }
+    }
+    ──────
+  ### Paso 8.5: Crear el Controlador BoardsController
+
+  Ahora expondremos el endpoint de la API para que el cliente pueda realizar peticiones de creación de tableros.
+
+  1. Crea el archivo BoardsController.cs dentro de la carpeta TodoSaaS.WebApi/Controllers/ con el siguiente código:
+
+    using Microsoft.AspNetCore.Mvc;
+    using TodoSaaS.Application.Boards.Commands.CreateBoard;
+
+    namespace TodoSaaS.WebApi.Controllers;
+
+    public class BoardsController : ApiControllerBase
+    {
+        [HttpPost]
+        public async Task<ActionResult<Guid>> Create(CreateBoardCommand command)
+        {
+            var boardId = await Mediator.Send(command);
+            return Ok(boardId);
+        }
+    }
+    ──────
