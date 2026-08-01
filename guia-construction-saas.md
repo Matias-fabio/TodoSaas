@@ -948,3 +948,111 @@ Ahora que la entidad Workspace está cubierta, el siguiente paso natural es impl
         }
     }
     ──────
+
+## FASE 9: Consultar Tableros de un Workspace (RESTful Query)
+
+  Una vez subido a Git, vamos a construir la consulta para obtener los tableros de un espacio de trabajo específico.
+
+  En el diseño de APIs RESTful, para consultar recursos que dependen de otros, solemos utilizar rutas anidadas. La URL ideal para
+  esto sería:
+  GET /api/workspaces/{workspaceId}/boards (dame los tableros que pertenecen a este workspace).
+
+  Implementemos este caso de uso:
+
+  ### Paso 9.1: Crear el BoardDto
+
+  1. Dentro de TodoSaaS.Application/Boards/, crea una carpeta llamada Queries.
+  2. Crea el archivo BoardDto.cs en esa carpeta con el siguiente código:
+
+    namespace TodoSaaS.Application.Boards.Queries;
+    
+    public class BoardDto
+    {
+        public Guid Id { get; set; }
+        public string Name { get; set; } = string.Empty;
+        public string Description { get; set; } = string.Empty;
+        public Guid WorkspaceId { get; set; }
+    }
+    ──────
+  ### Paso 9.2: Crear la consulta GetBoardsByWorkspaceQuery
+
+  1. Crea la carpeta GetBoardsByWorkspace dentro de TodoSaaS.Application/Boards/Queries/.
+  2. Crea el archivo GetBoardsByWorkspaceQuery.cs en esa carpeta con el siguiente código:
+
+    using MediatR;
+    
+    namespace TodoSaaS.Application.Boards.Queries.GetBoardsByWorkspace;
+    
+    public record GetBoardsByWorkspaceQuery(Guid WorkspaceId) : IRequest<List<BoardDto>>;
+    
+  (Nota: Aquí usamos un formato de record posicional, lo cual es muy cómodo porque define el constructor y la propiedad WorkspaceId
+  en una sola línea).
+  ──────
+  ### Paso 9.3: Crear el manejador GetBoardsByWorkspaceQueryHandler
+
+  En este manejador validaremos primero si el workspace existe (si no, lanzamos NotFoundException de nuevo), y si existe, retornamos
+  sus tableros.
+
+  1. Crea el archivo GetBoardsByWorkspaceQueryHandler.cs en la misma carpeta con este código:
+
+    using MediatR;
+    using Microsoft.EntityFrameworkCore;
+    using TodoSaaS.Application.Common.Interfaces;
+    using TodoSaaS.Application.Common.Exceptions;
+    using TodoSaaS.Domain.Entities;
+    
+    namespace TodoSaaS.Application.Boards.Queries.GetBoardsByWorkspace;
+    
+    public class GetBoardsByWorkspaceQueryHandler : IRequestHandler<GetBoardsByWorkspaceQuery, List<BoardDto>>
+    {
+        private readonly IApplicationDbContext _context;
+    
+        public GetBoardsByWorkspaceQueryHandler(IApplicationDbContext context)
+        {
+            _context = context;
+        }
+    
+        public async Task<List<BoardDto>> Handle(GetBoardsByWorkspaceQuery request, CancellationToken cancellationToken)
+        {
+            // 1. Validar que el Workspace exista
+            var workspaceExists = await _context.Workspaces
+                .AnyAsync(w => w.Id == request.WorkspaceId, cancellationToken);
+    
+            if (!workspaceExists)
+            {
+                throw new NotFoundException(nameof(Workspace), request.WorkspaceId);
+            }
+    
+            // 2. Retornar los tableros mapeados a DTOs
+            return await _context.Boards
+                .AsNoTracking()
+                .Where(b => b.WorkspaceId == request.WorkspaceId)
+                .Select(b => new BoardDto
+                {
+                    Id = b.Id,
+                    Name = b.Name,
+                    Description = b.Description,
+                    WorkspaceId = b.WorkspaceId
+                })
+                .ToListAsync(cancellationToken);
+        }
+    }
+    ──────
+  ### Paso 9.4: Exponer la ruta anidada en el controlador
+
+  Dado que la URL sugerida empieza por /api/workspaces, agregaremos este endpoint GET dentro de nuestro WorkspacesController para
+  mantener un diseño REST limpio.
+
+  1. Abre TodoSaaS.WebApi/Controllers/WorkspacesController.cs.
+  2. Agrega este endpoint debajo de tu endpoint GET anterior:
+
+        [HttpGet("{workspaceId}/boards")]
+        public async Task<ActionResult<List<BoardDto>>> GetBoards(Guid workspaceId)
+        {
+            var boards = await Mediator.Send(new GetBoardsByWorkspaceQuery(workspaceId));
+            return Ok(boards);
+        }
+
+  (No olvides agregar el using TodoSaaS.Application.Boards.Queries; y using
+  TodoSaaS.Application.Boards.Queries.GetBoardsByWorkspace; en los usings del controlador).
+  ──────
